@@ -246,8 +246,7 @@ class BrighterFatterKernelSolveTask(pipeBase.PipelineTask):
             
             # Get single Cov model sample
             mask = np.zeros(mask.shape, dtype=bool) # added
-            temp = np.asarray(inputPtc.rawMeans[ampName]) <=  self.config.covSample # added
-            index = len(np.asarray(inputPtc.rawMeans[ampName])[temp]) - 1 # added
+            index = np.argmin( ( np.asarray(inputPtc.rawMeans[ampName]) -  self.config.covSample )**2 )
             mask[index] = True # added
             
             # Convert to A matrix

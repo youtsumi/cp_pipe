@@ -267,7 +267,7 @@ class BrighterFatterKernelSolveTask(pipeBase.PipelineTask):
             _n = inputPtc.noise[ampName]
             
             A       = (_C_model[0])/ _mu**2
-            A[0][0] = (_C_model[0][0][0] / _mu**2) - (_mu/_g + _n/_g**2)/(_mu**2)
+            A[0][0] -= (_mu/_g + _n/_g**2)/(_mu**2)
             
             if gain <= 0:
                 # We've received very bad data.
@@ -350,7 +350,7 @@ class BrighterFatterKernelSolveTask(pipeBase.PipelineTask):
                 # preKernel = np.pad(self._tileArray(-1.0 * np.array(inputPtc.aMatrix[ampName])), ((1, 1)))
                 
                 # Use the analytical A matrix from sampled covariance model
-                preKernel = np.pad(self._tileArray(-1.0 * A), ((1, 1)))
+                preKernel = np.pad(self._tileArray(-2.0 * A), ((1, 1)))  # the factor of 2 comes from the wired inconsistent definition of Astier's PTC
                 
             elif self.config.correlationQuadraticFit:
                 # Use a quadratic fit to the correlations as a

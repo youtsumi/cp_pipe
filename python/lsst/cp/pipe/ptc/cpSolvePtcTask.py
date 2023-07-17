@@ -122,45 +122,49 @@ class PhotonTransferCurveSolveConfig(pipeBase.PipelineTaskConfig,
         doc="Degree of polynomial to fit the PTC, when 'ptcFitType'=POLYNOMIAL.",
         default=3,
     )
-    doLegacyTurnoffAndOutlierSelection = pexConfig.Field(
+    doLegacyTurnoffSelection = pexConfig.Field(
         dtype=bool,
-        doc="Use 'legacy' computation for PTC turnoff and outlier selection. If set "
+        doc="Use 'legacy' computation for PTC turnoff selection. If set "
             "to False, then the KS test p-value selection will be used instead.",
         default=False,
     )
     sigmaCutPtcOutliers = pexConfig.Field(
         dtype=float,
-        doc="Sigma cut for outlier rejection in PTC. Only used if "
-            "doLegacyTurnoffAndOutlierSelection is True.",
+        doc="Sigma cut for outlier rejection in PTC.",
         default=5.0,
     )
     maxIterationsPtcOutliers = pexConfig.RangeField(
         dtype=int,
-        doc="Maximum number of iterations for outlier rejection in PTC. Only used if "
-            "doLegacyTurnoffAndOutlierSelection is True.",
+        doc="Maximum number of iterations for outlier rejection in PTC.",
         default=2,
         min=0
+    )
+    maxSignalInitialPtcOutlierFit = pexConfig.Field(
+        dtype=float,
+        doc="Maximum signal considered for intial outlier fit. This should be below "
+            "the PTC turnoff to ensure accurate outlier rejection.",
+        default=30_000.,
     )
     minVarPivotSearch = pexConfig.Field(
         dtype=float,
         doc="The code looks for a pivot signal point after which the variance starts decreasing at high-flux"
             " to exclude then from the PTC model fit. However, sometimes at low fluxes, the variance"
             " decreases slightly. Set this variable for the variance value, in ADU^2, after which the pivot "
-            " should be sought. Only used if doLegacyTurnoffAndOutlierSelection is True.",
+            " should be sought. Only used if doLegacyTurnoffSelection is True.",
         default=10000,
     )
     consecutivePointsVarDecreases = pexConfig.RangeField(
         dtype=int,
         doc="Required number of consecutive points/fluxes in the PTC where the variance "
             "decreases in order to find a first estimate of the PTC turn-off. "
-            "Only used if doLegacyTurnoffAndOutlierSelection is True.",
+            "Only used if doLegacyTurnoffSelection is True.",
         default=2,
         min=2
     )
     ksTestMinPvalue = pexConfig.Field(
         dtype=float,
         doc="Minimum value of the Gaussian histogram KS test p-value to be used in PTC fit. "
-            "Only used if doLegacyTurnoffAndOutlierSelection is False.",
+            "Only used if doLegacyTurnoffSelection is False.",
         default=0.01,
     )
     doFitBootstrap = pexConfig.Field(
@@ -328,11 +332,17 @@ class PhotonTransferCurveSolveTask(pipeBase.PipelineTask):
                     expIdMask = False
 
                 kspValue = partialPtcDataset.kspValues[ampName][0]
-                if not self.config.doLegacyTurnoffAndOutlierSelection and \
+                if not self.config.doLegacyTurnoffSelection and \
                    kspValue < self.config.ksTestMinPvalue:
                     expIdMask = False
 
                 datasetPtc.expIdMask[ampName] = np.append(datasetPtc.expIdMask[ampName], expIdMask)
+
+            for key, value in partialPtcDataset.auxValues.items():
+                if key in datasetPtc.auxValues:
+                    datasetPtc.auxValues[key] = np.append(datasetPtc.auxValues[key], value)
+                else:
+                    datasetPtc.auxValues[key] = value
 
         # Sort arrays that are filled so far in the final dataset by
         # rawMeans index.
@@ -357,9 +367,14 @@ class PhotonTransferCurveSolveTask(pipeBase.PipelineTask):
             datasetPtc.rawExpTimes[ampName] = datasetPtc.rawExpTimes[ampName][index]
             datasetPtc.rawMeans[ampName] = datasetPtc.rawMeans[ampName][index]
             datasetPtc.rawVars[ampName] = datasetPtc.rawVars[ampName][index]
+            datasetPtc.histVars[ampName] = datasetPtc.histVars[ampName][index]
+            datasetPtc.histChi2Dofs[ampName] = datasetPtc.histChi2Dofs[ampName][index]
+            datasetPtc.kspValues[ampName] = datasetPtc.kspValues[ampName][index]
             datasetPtc.expIdMask[ampName] = datasetPtc.expIdMask[ampName][index]
             datasetPtc.covariances[ampName] = datasetPtc.covariances[ampName][index]
             datasetPtc.covariancesSqrtWeights[ampName] = datasetPtc.covariancesSqrtWeights[ampName][index]
+        for key, value in datasetPtc.auxValues.items():
+            datasetPtc.auxValues[key] = value[index]
 
         if self.config.ptcFitType == "FULLCOVARIANCE":
             # Fit the measured covariances vs mean signal to
@@ -497,6 +512,8 @@ class PhotonTransferCurveSolveTask(pipeBase.PipelineTask):
                 dataset.bMatrix[ampName] = nanMatrix
                 dataset.covariancesModelNoB[ampName] = listNanMatrix
                 dataset.aMatrixNoB[ampName] = nanMatrix
+                dataset.noiseMatrix[ampName] = nanMatrix
+                dataset.noiseMatrixNoB[ampName] = nanMatrix
 
                 dataset.expIdMask[ampName] = np.repeat(False, lenInputTimes)
                 dataset.gain[ampName] = np.nan
@@ -584,6 +601,9 @@ class PhotonTransferCurveSolveTask(pipeBase.PipelineTask):
             dataset.noise[ampName] = readoutNoise
             readoutNoiseSigma = fitResults['fullModel']['paramsErr'][2*lenParams]
             dataset.noiseErr[ampName] = 0.5*(readoutNoiseSigma/np.fabs(readoutNoise))*readoutNoiseSqrt
+            dataset.noiseMatrix[ampName] = fitResults['fullModel']['noise']
+            dataset.noiseMatrixNoB[ampName] = fitResults['fullModelNoB']['noise']
+
             dataset.finalVars[ampName] = covAtAmp[:, 0, 0]
             dataset.finalModelVars[ampName] = dataset.covariancesModel[ampName][:, 0, 0]
             dataset.finalMeans[ampName] = muAtAmp
@@ -640,7 +660,7 @@ class PhotonTransferCurveSolveTask(pipeBase.PipelineTask):
                     # model equation (Eq. 20) in Astier+19, with c=a*b=0:
                     a[i, j] += parsFit[0]
                     noise[i, j] += parsFit[2]
-                    if(i + j == 0):
+                    if i + j == 0:
                         gain = 1./(1/gain+parsFit[1])
             weightedRes = (model - cov)*sqrtW
             chi2 = (weightedRes.flatten()**2).sum()
@@ -781,7 +801,7 @@ class PhotonTransferCurveSolveTask(pipeBase.PipelineTask):
     # EXPAPPROXIMATION and POLYNOMIAL fit methods
     @staticmethod
     def _initialParsForPolynomial(order):
-        assert(order >= 2)
+        assert order >= 2
         pars = np.zeros(order, dtype=float)
         pars[0] = 10
         pars[1] = 1
@@ -940,6 +960,8 @@ class PhotonTransferCurveSolveTask(pipeBase.PipelineTask):
             dataset.bMatrix[amp] = nanMatrix
             dataset.covariancesModelNoB[amp] = listNanMatrix
             dataset.aMatrixNoB[amp] = nanMatrix
+            dataset.noiseMatrix[amp] = nanMatrix
+            dataset.noiseMatrixNoB[amp] = nanMatrix
 
         def errFunc(p, x, y):
             return ptcFunc(p, x) - y
@@ -948,12 +970,11 @@ class PhotonTransferCurveSolveTask(pipeBase.PipelineTask):
         maxIterationsPtcOutliers = self.config.maxIterationsPtcOutliers
 
         for i, ampName in enumerate(dataset.ampNames):
-            timeVecOriginal = dataset.rawExpTimes[ampName]
-            meanVecOriginal = dataset.rawMeans[ampName]
-            varVecOriginal = dataset.rawVars[ampName]
+            meanVecOriginal = dataset.rawMeans[ampName].copy()
+            varVecOriginal = dataset.rawVars[ampName].copy()
             varVecOriginal = self._makeZeroSafe(varVecOriginal)
 
-            if self.config.doLegacyTurnoffAndOutlierSelection:
+            if self.config.doLegacyTurnoffSelection:
                 # Discard points when the variance starts to decrease after two
                 # consecutive signal levels
                 goodPoints = self._getInitialGoodPoints(meanVecOriginal, varVecOriginal,
@@ -974,11 +995,6 @@ class PhotonTransferCurveSolveTask(pipeBase.PipelineTask):
                 self.fillBadAmp(dataset, ptcFitType, ampName)
                 continue
 
-            # Save the point where the variance starts decreasing as the
-            # PTC turnoff point
-            ptcTurnoff = meanVecOriginal[goodPoints][-1]
-            dataset.ptcTurnoff[ampName] = ptcTurnoff
-
             mask = goodPoints
 
             if ptcFitType == 'EXPAPPROXIMATION':
@@ -996,50 +1012,19 @@ class PhotonTransferCurveSolveTask(pipeBase.PipelineTask):
                 parsIniPtc = self._initialParsForPolynomial(self.config.polynomialFitDegree + 1)
                 bounds = self._boundsForPolynomial(parsIniPtc)
 
-            if self.config.doLegacyTurnoffAndOutlierSelection:
-                # Before bootstrap fit, do an iterative fit to get rid of
-                # outliers. This further process of outlier rejection be
-                # skipped if self.config.maxIterationsPtcOutliers = 0.
-                # We already did some initial outlier rejection above in
-                # self._getInitialGoodPoints.
-                count = 1
-                newMask = np.ones_like(meanVecOriginal, dtype=bool)
-                pars = parsIniPtc
-                while count <= maxIterationsPtcOutliers:
-                    # Note that application of the mask actually shrinks the
-                    # array to size rather than setting elements to zero (as we
-                    # want) so always update mask itself and re-apply to the
-                    # original data.
-                    meanTempVec = meanVecOriginal[mask]
-                    varTempVec = varVecOriginal[mask]
-                    res = least_squares(errFunc, parsIniPtc, bounds=bounds, args=(meanTempVec, varTempVec))
-                    pars = res.x
+            # We perform an initial (unweighted) fit of variance vs signal
+            # (after initial KS test or post-drop selection) to look for
+            # outliers, particularly at the high-flux end. The initial fit
+            # is performed only for points that are guaranteed to be below
+            # the PTC turnoff and then extrapolated to ensure that high
+            # flux points that have abnormal variance values can be properly
+            # rejected in this phase without biasing the initial fit.
+            # This algorithm was initially developed by Seth Digel for
+            # the EO Testing pipeline.
 
-                    # change this to the original from the temp because
-                    # the masks are ANDed meaning once a point is masked
-                    # it's always masked, and the masks must always be the
-                    # same length for broadcasting
-                    sigResids = (varVecOriginal - ptcFunc(pars, meanVecOriginal))/np.sqrt(varVecOriginal)
-                    newMask = np.array([True if np.abs(r) < sigmaCutPtcOutliers else False
-                                        for r in sigResids])
-                    mask = mask & newMask
-                    if not (mask.any() and newMask.any()):
-                        msg = (f"SERIOUS: All points in either mask: {mask} or newMask: {newMask} are bad. "
-                               f"Setting {ampName} to BAD.")
-                        self.log.warning(msg)
-                        # Fill entries with NaNs
-                        self.fillBadAmp(dataset, ptcFitType, ampName)
-                        break
-                    nDroppedTotal = Counter(mask)[False]
-                    self.log.debug("Iteration %d: discarded %d points in total for %s",
-                                   count, nDroppedTotal, ampName)
-                    count += 1
-                    # objects should never shrink
-                    assert (len(mask) == len(timeVecOriginal) == len(meanVecOriginal) == len(varVecOriginal))
-            else:
-                pars = parsIniPtc
-                meanTempVec = meanVecOriginal[mask]
-                varTempVec = varVecOriginal[mask]
+            if maxIterationsPtcOutliers == 0:
+                # We are not doing any outlier rejection here, but we do want
+                # an initial fit.
                 res = least_squares(
                     errFunc,
                     parsIniPtc,
@@ -1047,21 +1032,70 @@ class PhotonTransferCurveSolveTask(pipeBase.PipelineTask):
                     args=(meanVecOriginal[mask], varVecOriginal[mask]),
                 )
                 pars = res.x
-                newMask = mask
-
-            if not (mask.any() and newMask.any()):
-                continue
-            dataset.expIdMask[ampName] = np.array(dataset.expIdMask[ampName])
-            # store the final mask
-            if len(dataset.expIdMask[ampName]):
-                dataset.expIdMask[ampName] &= mask  # bitwise_and if there is already a mask
+                newMask = mask.copy()
             else:
-                dataset.expIdMask[ampName] = mask
-            # In case there was a previous mask stored
-            mask = dataset.expIdMask[ampName]
+                newMask = (mask & (meanVecOriginal <= self.config.maxSignalInitialPtcOutlierFit))
+
+                count = 0
+                lastMask = mask.copy()
+                while count < maxIterationsPtcOutliers:
+                    res = least_squares(
+                        errFunc,
+                        parsIniPtc,
+                        bounds=bounds,
+                        args=(meanVecOriginal[newMask], varVecOriginal[newMask]),
+                    )
+                    pars = res.x
+
+                    sigResids = (varVecOriginal - ptcFunc(pars, meanVecOriginal))/np.sqrt(varVecOriginal)
+                    # The new mask includes points where the residuals are
+                    # finite, are less than the cut, and include the original
+                    # mask of known points that should not be used.
+                    newMask = (
+                        np.isfinite(sigResids)
+                        & (np.abs(np.nan_to_num(sigResids)) < sigmaCutPtcOutliers)
+                        & mask
+                    )
+                    if np.count_nonzero(newMask) == 0:
+                        msg = (f"SERIOUS: All points after outlier rejection are bad. "
+                               f"Setting {ampName} to BAD.")
+                        self.log.warning(msg)
+                        # Fill entries with NaNs
+                        self.fillBadAmp(dataset, ptcFitType, ampName)
+                        break
+
+                    self.log.debug(
+                        "Iteration %d: Removed %d points in total for %s.",
+                        count,
+                        np.count_nonzero(mask) - np.count_nonzero(newMask),
+                        ampName,
+                    )
+
+                    # If the mask hasn't changed then break out.
+                    if np.all(newMask == lastMask):
+                        self.log.debug("Convergence at iteration %d; breaking loop for %s.", count, ampName)
+                        break
+
+                    lastMask = newMask.copy()
+
+                    count += 1
+
+            # Set the mask to the new mask
+            mask = newMask.copy()
+
+            if not mask.any():
+                # We hae already filled the bad amp above, so continue.
+                continue
+
+            dataset.expIdMask[ampName] = mask
+
             parsIniPtc = pars
             meanVecFinal = meanVecOriginal[mask]
             varVecFinal = varVecOriginal[mask]
+
+            # Save the maximum point after outlier detection as the
+            # PTC turnoff point.
+            dataset.ptcTurnoff[ampName] = meanVecFinal[-1]
 
             if Counter(mask)[False] > 0:
                 self.log.info("Number of points discarded in PTC of amplifier %s:"

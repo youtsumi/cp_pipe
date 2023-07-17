@@ -22,6 +22,7 @@
 import numpy as np
 from lmfit.models import GaussianModel
 import scipy.stats
+import warnings
 
 import lsst.afw.math as afwMath
 import lsst.pex.config as pexConfig
@@ -195,6 +196,11 @@ class PhotonTransferCurveExtractConfig(pipeBase.PipelineTaskConfig,
         dtype=int,
         doc="Minimum number of good data values to compute KS test histogram.",
         default=100,
+    )
+    auxiliaryHeaderKeys = pexConfig.ListField(
+        dtype=str,
+        doc="Auxiliary header keys to store with the PTC dataset.",
+        default=[],
     )
 
 
@@ -434,6 +440,22 @@ class PhotonTransferCurveExtractTask(pipeBase.PipelineTask):
                 isrTask.maskEdges(exp2, numEdgePixels=self.config.numEdgeSuspect,
                                   maskPlane="SUSPECT", level=self.config.edgeMaskLevel)
 
+            # Extract any metadata keys from the headers.
+            auxDict = {}
+            metadata = exp1.getMetadata()
+            for key in self.config.auxiliaryHeaderKeys:
+                if key not in metadata:
+                    self.log.warning(
+                        "Requested auxiliary keyword %s not found in exposure metadata for %d",
+                        key,
+                        expId1,
+                    )
+                    value = np.nan
+                else:
+                    value = metadata[key]
+
+                auxDict[key] = value
+
             nAmpsNan = 0
             partialPtcDataset = PhotonTransferCurveDataset(ampNames, 'PARTIAL',
                                                            self.config.maximumRangeCovariancesAstier)
@@ -449,6 +471,23 @@ class PhotonTransferCurveExtractTask(pipeBase.PipelineTask):
                 # `measureMeanVarCov` and `getGainFromFlatPair`.
                 im1Area, im2Area, imStatsCtrl, mu1, mu2 = self.getImageAreasMasksStats(exp1, exp2,
                                                                                        region=region)
+
+                # We demand that both mu1 and mu2 be finite and greater than 0.
+                if not np.isfinite(mu1) or not np.isfinite(mu2) \
+                   or ((np.nan_to_num(mu1) + np.nan_to_num(mu2)/2.) <= 0.0):
+                    self.log.warning(
+                        "Illegal mean value(s) detected for amp %s on exposure pair %d/%d",
+                        ampName,
+                        expId1,
+                        expId2,
+                    )
+                    partialPtcDataset.setAmpValuesPartialDataset(
+                        ampName,
+                        inputExpIdPair=(expId1, expId2),
+                        rawExpTime=expTime,
+                        expIdMask=False,
+                    )
+                    continue
 
                 # `measureMeanVarCov` is the function that measures
                 # the variance and covariances from a region of
@@ -549,6 +588,8 @@ class PhotonTransferCurveExtractTask(pipeBase.PipelineTask):
                     histChi2Dof=histChi2Dof,
                     kspValue=kspValue,
                 )
+
+            partialPtcDataset.setAuxValuesPartialDataset(auxDict)
 
             # Use location of exp1 to save PTC dataset from (exp1, exp2) pair.
             # Below, np.where(expId1 == np.array(inputDims)) returns a tuple
@@ -1000,7 +1041,19 @@ class PhotonTransferCurveExtractTask(pipeBase.PipelineTask):
             errVals = np.sqrt(yVals)
             errVals[(errVals == 0.0)] = 1.0
             pars = model.guess(yVals, x=xVals)
-            out = model.fit(yVals, pars, x=xVals, weights=1./errVals, calc_covar=True, method="least_squares")
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                # The least-squares fitter sometimes spouts (spurious) warnings
+                # when the model is very bad. Swallow these warnings now and
+                # let the KS test check the model below.
+                out = model.fit(
+                    yVals,
+                    pars,
+                    x=xVals,
+                    weights=1./errVals,
+                    calc_covar=True,
+                    method="least_squares",
+                )
 
             # Calculate chi2.
             chiArr = out.residual
@@ -1009,8 +1062,12 @@ class PhotonTransferCurveExtractTask(pipeBase.PipelineTask):
             sigmaFit = out.params["sigma"].value
 
             # Calculate KS test p-value for the fit.
-            gSample = scipy.stats.norm.rvs(size=numOk, scale=sigmaFit, loc=out.params["center"].value)
-            ksResult = scipy.stats.ks_2samp(diffArr, gSample)
+            ksResult = scipy.stats.ks_1samp(
+                diffArr,
+                scipy.stats.norm.cdf,
+                (out.params["center"].value, sigmaFit),
+            )
+
             kspValue = ksResult.pvalue
             if kspValue < 1e-15:
                 kspValue = 0.0

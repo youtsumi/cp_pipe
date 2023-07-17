@@ -250,9 +250,9 @@ class BrighterFatterKernelSolveTask(pipeBase.PipelineTask):
             mask = inputPtc.expIdMask[ampName]
             
             # Get single Cov model sample
-            mask = np.zeros(mask.shape, dtype=bool) # added
+            _mask = np.zeros(mask.shape, dtype=bool) # added
             index = np.argmin( ( np.asarray(inputPtc.rawMeans[ampName]) - self.config.covSample )**2 )
-            mask[index] = True # added
+            _mask[index] = True # added
             
             # Convert to A matrix
             if self.config.covSample > 0:
@@ -268,22 +268,22 @@ class BrighterFatterKernelSolveTask(pipeBase.PipelineTask):
 
                 #_n = h[1].data['NOISE_MATRIX'][ampnoiseindx[ampName]].reshape(8,8)
                 _g  = inputPtc.gain[ampName] 
-                _mu = np.asarray(inputPtc.rawMeans[ampName])[mask]
-                _C_model = np.asarray(inputPtc.covariancesModel[ampName])[mask]
+                _mu = np.asarray(inputPtc.rawMeans[ampName])[_mask]
+                _C_model = np.asarray(inputPtc.covariancesModel[ampName])[_mask]
                 _n = inputPtc.noise[ampName]
 
                 A       = (_C_model[0])/ _mu**2
                 A[0][0] = (_C_model[0][0][0] / _mu**2) - (_mu/_g + _n/_g**2)/(_mu**2)
 
-                if gain <= 0:
-                    # We've received very bad data.
-                    self.log.warning("Impossible gain recieved from PTC for %s: %f. Skipping bad amplifier.",
-                                     ampName, gain)
-                    bfk.meanXcorrs[ampName] = np.zeros(bfk.shape)
-                    bfk.ampKernels[ampName] = np.zeros(bfk.shape)
-                    bfk.rawXcorrs[ampName] = np.zeros((len(mask), inputPtc.covMatrixSide, inputPtc.covMatrixSide))
-                    bfk.valid[ampName] = False
-                    continue
+            if gain <= 0:
+                # We've received very bad data.
+                self.log.warning("Impossible gain recieved from PTC for %s: %f. Skipping bad amplifier.",
+                                 ampName, gain)
+                bfk.meanXcorrs[ampName] = np.zeros(bfk.shape)
+                bfk.ampKernels[ampName] = np.zeros(bfk.shape)
+                bfk.rawXcorrs[ampName] = np.zeros((len(mask), inputPtc.covMatrixSide, inputPtc.covMatrixSide))
+                bfk.valid[ampName] = False
+                continue
 
             # Use inputPtc.expIdMask to get the means, variances, and
             # covariances that were not masked after PTC.  The

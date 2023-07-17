@@ -137,6 +137,16 @@ class BrighterFatterKernelSolveConfig(pipeBase.PipelineTaskConfig,
         doc="Slope of the correlation model for radii larger than correlationModelRadius",
         default=-1.35,
     )
+    covSample = pexConfig.Field(
+        dtype=float,
+        doc="Signal level in ADU where to sample the covariance model.",
+        default=0.0,
+    )
+    scaleFactor = pexConfig.Field(
+        dtype=float,
+        doc="Factor used to scale the A matrix.",
+        default=0.0,
+    )
 
 
 class BrighterFatterKernelSolveTask(pipeBase.PipelineTask):
@@ -197,6 +207,17 @@ class BrighterFatterKernelSolveTask(pipeBase.PipelineTask):
 
         detector = camera[inputDims['detector']]
         detName = detector.getName()
+        
+        pcti = {"R03_S12": (1.0e5)/1.702,
+                "R24_S11": (0.9e5)/1.498,
+                "R21_S02": (0.75e5)/1.497,
+                "R02_S00": (0.8e5)/1.679}
+        
+        ptc  = {"R03_S12": 77000.,
+                "R24_S11": 80000.,
+                "R21_S02": 68000.,
+                "R02_S00": 60000.}
+        
 
         if self.config.level == 'DETECTOR':
             detectorCorrList = list()
@@ -209,8 +230,10 @@ class BrighterFatterKernelSolveTask(pipeBase.PipelineTask):
 
         # Use the PTC covariances as the cross-correlations.  These
         # are scaled before the kernel is generated, which performs
-        # the conversion.
+        # the conversion.  The input covariances are in (x, y) index
+        # ordering, as is the aMatrix.
         bfk.rawXcorrs = inputPtc.covariances  # ADU^2
+        #bfk.rawXcorrs = inputPtc.covariancesModel # ADU^2
         bfk.badAmps = inputPtc.badAmps
         bfk.shape = (inputPtc.covMatrixSide*2 + 1, inputPtc.covMatrixSide*2 + 1)
         bfk.gain = inputPtc.gain
@@ -219,19 +242,48 @@ class BrighterFatterKernelSolveTask(pipeBase.PipelineTask):
         bfk.valid = dict()
         bfk.updateMetadataFromExposures([inputPtc])
 
+        ampnoiseindx = {'C00': 15,'C01': 14,'C02': 13,'C03': 12,'C04': 11,'C05': 10,'C06': 9,'C07': 8,'C11': 1,'C12': 2,'C13': 3,'C14': 4,'C15': 5,'C16': 6,'C17': 7,'C10': 0}
+        
         for amp in detector:
             ampName = amp.getName()
             gain = bfk.gain[ampName]
             mask = inputPtc.expIdMask[ampName]
-            if gain <= 0:
-                # We've received very bad data.
-                self.log.warning("Impossible gain recieved from PTC for %s: %f. Skipping bad amplifier.",
-                                 ampName, gain)
-                bfk.meanXcorrs[ampName] = np.zeros(bfk.shape)
-                bfk.ampKernels[ampName] = np.zeros(bfk.shape)
-                bfk.rawXcorrs[ampName] = np.zeros((len(mask), inputPtc.covMatrixSide, inputPtc.covMatrixSide))
-                bfk.valid[ampName] = False
-                continue
+            
+            # Get single Cov model sample
+            mask = np.zeros(mask.shape, dtype=bool) # added
+            index = np.argmin( ( np.asarray(inputPtc.rawMeans[ampName]) - self.config.covSample )**2 )
+            mask[index] = True # added
+            
+            # Convert to A matrix
+            if self.config.covSample > 0:
+                from astropy.io import fits
+                #if detName == "R03_S12":
+                #    h = fits.open("/sdf/group/rubin/repo/main/u/abrought/BF/2023.06.16/ptc.R03-S12.trunc_to_pcti.fullnoisematrix/20230710T213347Z/ptc/ptc_LSSTCam_R03_S12_u_abrought_BF_2023_06_16_ptc_R03-S12_trunc_to_pcti_fullnoisematrix_20230710T213347Z.fits")
+                #elif detName == "R24_S11":
+                #    h = fits.open("/sdf/group/rubin/repo/main/u/abrought/BF/2023.06.16/ptc.R24-S11.trunc_to_pcti.fullnoisematrix/20230710T213533Z/ptc/ptc_LSSTCam_R24_S11_u_abrought_BF_2023_06_16_ptc_R24-S11_trunc_to_pcti_fullnoisematrix_20230710T213533Z.fits")
+                #elif detName == "R02_S00":
+                #    h = fits.open("/sdf/group/rubin/repo/main/u/abrought/BF/2023.06.16/ptc.R02-S00.trunc_to_pcti.fullnoisematrix/20230710T235125Z/ptc/ptc_LSSTCam_R02_S00_u_abrought_BF_2023_06_16_ptc_R02-S00_trunc_to_pcti_fullnoisematrix_20230710T235125Z.fits")
+                #else: 
+                #    h = fits.open("/sdf/group/rubin/repo/main/u/abrought/BF/2023.06.16/ptc.R21-S02.trunc_to_pcti.fullnoisematrix/20230710T225605Z/ptc/ptc_LSSTCam_R21_S02_u_abrought_BF_2023_06_16_ptc_R21-S02_trunc_to_pcti_fullnoisematrix_20230710T225605Z.fits")
+
+                #_n = h[1].data['NOISE_MATRIX'][ampnoiseindx[ampName]].reshape(8,8)
+                _g  = inputPtc.gain[ampName] 
+                _mu = np.asarray(inputPtc.rawMeans[ampName])[mask]
+                _C_model = np.asarray(inputPtc.covariancesModel[ampName])[mask]
+                _n = inputPtc.noise[ampName]
+
+                A       = (_C_model[0])/ _mu**2
+                A[0][0] = (_C_model[0][0][0] / _mu**2) - (_mu/_g + _n/_g**2)/(_mu**2)
+
+                if gain <= 0:
+                    # We've received very bad data.
+                    self.log.warning("Impossible gain recieved from PTC for %s: %f. Skipping bad amplifier.",
+                                     ampName, gain)
+                    bfk.meanXcorrs[ampName] = np.zeros(bfk.shape)
+                    bfk.ampKernels[ampName] = np.zeros(bfk.shape)
+                    bfk.rawXcorrs[ampName] = np.zeros((len(mask), inputPtc.covMatrixSide, inputPtc.covMatrixSide))
+                    bfk.valid[ampName] = False
+                    continue
 
             # Use inputPtc.expIdMask to get the means, variances, and
             # covariances that were not masked after PTC.  The
@@ -301,7 +353,11 @@ class BrighterFatterKernelSolveTask(pipeBase.PipelineTask):
 
             if self.config.useAmatrix:
                 # Use the aMatrix, ignoring the meanXcorr generated above.
-                preKernel = np.pad(self._tileArray(-1.0 * np.array(inputPtc.aMatrix[ampName])), ((1, 1)))
+                preKernel = np.pad(self._tileArray(-1.0 * self.config.scaleFactor * np.array(inputPtc.aMatrix[ampName])), ((1, 1)))
+                
+                # Use the analytical A matrix from sampled covariance model
+                #preKernel = np.pad(self._tileArray(-1.0 * A), ((1, 1)))
+                
             elif self.config.correlationQuadraticFit:
                 # Use a quadratic fit to the correlations as a
                 # function of flux.
@@ -372,12 +428,13 @@ class BrighterFatterKernelSolveTask(pipeBase.PipelineTask):
             The averaged cross-correlation.
         """
         meanXcorr = np.zeros_like(xCorrList[0])
-        xCorrList = np.transpose(xCorrList)
+        xCorrList = np.array(xCorrList)
+
         sctrl = afwMath.StatisticsControl()
         sctrl.setNumSigmaClip(self.config.nSigmaClip)
         for i in range(np.shape(meanXcorr)[0]):
             for j in range(np.shape(meanXcorr)[1]):
-                meanXcorr[i, j] = afwMath.makeStatistics(xCorrList[i, j],
+                meanXcorr[i, j] = afwMath.makeStatistics(xCorrList[:, i, j],
                                                          afwMath.MEANCLIP, sctrl).getValue()
 
         # To match previous definitions, pad by one element.
@@ -409,11 +466,11 @@ class BrighterFatterKernelSolveTask(pipeBase.PipelineTask):
 
         for i in range(np.shape(meanXcorr)[0]):
             for j in range(np.shape(meanXcorr)[1]):
-                # Fit corrlation_i(x, y) = a0 + a1 * (flux_i)^2 The
-                # i,j indices are inverted to apply the transposition,
-                # as is done in the averaging case.
+                # Fit corrlation_i(x, y) = a0 + a1 * (flux_i)^2 We do
+                # not want to transpose, so use (i, j) without
+                # inversion.
                 linearFit, linearFitErr, chiSq, weights = irlsFit([0.0, 1e-4], fluxList,
-                                                                  xCorrList[:, j, i], funcPolynomial,
+                                                                  xCorrList[:, i, j], funcPolynomial,
                                                                   scaleResidual=False)
                 meanXcorr[i, j] = linearFit[1]  # Discard the intercept.
                 self.log.info("Quad fit meanXcorr[%d,%d] = %g", i, j, linearFit[1])

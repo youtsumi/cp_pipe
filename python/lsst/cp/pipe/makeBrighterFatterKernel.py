@@ -350,7 +350,7 @@ class BrighterFatterKernelSolveTask(pipeBase.PipelineTask):
                 # preKernel = np.pad(self._tileArray(-1.0 * np.array(inputPtc.aMatrix[ampName])), ((1, 1)))
                 
                 # Use the analytical A matrix from sampled covariance model
-                preKernel = np.pad(self._tileArray(-2.0 * A), ((1, 1)))  # the factor of 2 comes from the wired inconsistent definition of Astier's PTC
+                preKernel = np.pad(self._tileArray(-1.0 * A), ((1, 1)))
                 
             elif self.config.correlationQuadraticFit:
                 # Use a quadratic fit to the correlations as a
